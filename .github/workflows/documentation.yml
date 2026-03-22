@@ -10,10 +10,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: astral-sh/setup-uv@v7
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          uv sync
       - name: Sphinx build
         run: |
           sphinx-build docs build
