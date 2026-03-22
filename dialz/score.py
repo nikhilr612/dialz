@@ -1,19 +1,24 @@
-import typing
-import warnings
+from typing import Any
 
 import torch
 from transformers import AutoTokenizer
 
-if typing.TYPE_CHECKING:
-    from .vector import SteeringVector, SteeringModel
+from .shared import model_layer_list
+from .types import ScoringMethod
+
+if True:  # TYPE_CHECKING at runtime for forward refs
+    from typing import TYPE_CHECKING
+
+    if TYPE_CHECKING:
+        from .vector import SteeringModel, SteeringVector
 
 
 def get_activation_score(
     input_text: str,
     model: "SteeringModel",
     control_vector: "SteeringVector",
-    layer_index=None,  # can be int or list of ints
-    scoring_method: str = "mean",  # 'mean', 'final_token', 'max_token', or 'median_token'
+    layer_index: int | list[int] | None = None,
+    scoring_method: ScoringMethod = ScoringMethod.MEAN,
 ) -> tuple[float, int, list[float]]:
     """
     Compute the activation score for input_text by projecting hidden states onto
@@ -30,14 +35,14 @@ def get_activation_score(
         model (SteeringModel): The model to use for computing activations.
         control_vector (SteeringVector): Contains direction(s) keyed by layer index.
         layer_index (int or list[int], optional): Layer(s) to use. Defaults to last in model.layer_ids.
-        scoring_method (str): Scoring method to use.
+        scoring_method (ScoringMethod): Scoring method to use.
 
     :returns: A tuple containing:
 
         - score: Averaged activation score across selected layers.
 
         - token_len: Number of tokens in the input.
-        
+
         - unaggregated_scores: Unaggregated dot product scores for each layer.
     """
     # 1) Reset the model to ensure no control is applied.
@@ -56,11 +61,11 @@ def get_activation_score(
         layers_to_use = layer_index
 
     # 3) Prepare a container to store hidden states for each requested layer.
-    hook_states = {}
+    hook_states: dict[int, Any] = {}
 
     # 4) Define and register a hook function for each layer.
-    def get_hook_fn(key):
-        def hook_fn(module, inp, out):
+    def get_hook_fn(key: int) -> Any:
+        def hook_fn(module: torch.nn.Module, inp: Any, out: Any) -> None:
             # If out is a tuple (hidden, present, ...), take the first element.
             if isinstance(out, tuple):
                 hook_states[key] = out[0]
@@ -70,14 +75,6 @@ def get_activation_score(
         return hook_fn
 
     # 5) Retrieve the list of layers from the model.
-    def model_layer_list(m):
-        if hasattr(m, "model"):
-            return m.model.layers
-        elif hasattr(m, "transformer"):
-            return m.transformer.h
-        else:
-            raise ValueError("Cannot locate layers for this model type")
-
     layers = model_layer_list(model.model)
 
     # 6) For each provided layer index, compute its actual index and register the hook.
@@ -95,6 +92,7 @@ def get_activation_score(
     # 8) Encode the input text and perform a forward pass.
     encoded = tokenizer(input_text, return_tensors="pt", add_special_tokens=False)
     input_ids = encoded["input_ids"].to(model.device)
+    token_length = len(input_ids)
     with torch.no_grad():
         _ = model.model(input_ids)
 
@@ -124,16 +122,16 @@ def get_activation_score(
         dot_vals = hidden_states @ direction
         token_length = dot_vals.shape[0]
         # Determine score based on the scoring_method.
-        if scoring_method == "mean":
+        if scoring_method == ScoringMethod.MEAN:
             # Average over all tokens.
             score_tensor = dot_vals.mean()
-        elif scoring_method == "final_token":
+        elif scoring_method == ScoringMethod.FINAL_TOKEN:
             # Use only the final token.
             score_tensor = dot_vals[-1]
-        elif scoring_method == "max_token":
+        elif scoring_method == ScoringMethod.MAX_TOKEN:
             # Use the maximum token's dot product.
             score_tensor = dot_vals.max()
-        elif scoring_method == "median_token":
+        elif scoring_method == ScoringMethod.MEDIAN_TOKEN:
             # Use the median token's dot product.
             score_tensor = dot_vals.median()
         else:

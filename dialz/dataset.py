@@ -2,9 +2,8 @@ import json
 import os
 
 from dataclasses import dataclass
-from typing import List
 from dotenv import load_dotenv
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 load_dotenv()
 hf_token = os.getenv("HF_TOKEN")
@@ -25,11 +24,11 @@ class Dataset:
     A class to manage a dataset of positive and negative examples.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         """
         Initializes an empty dataset.
         """
-        self.entries: List[DatasetEntry] = []
+        self.entries: list[DatasetEntry] = []
 
     def add_entry(self, positive: str, negative: str) -> None:
         """
@@ -41,12 +40,12 @@ class Dataset:
         """
         self.entries.append(DatasetEntry(positive=positive, negative=negative))
 
-    def add_from_saved(self, saved_entries: List[dict]) -> None:
+    def add_from_saved(self, saved_entries: list[dict[str, str]]) -> None:
         """
         Adds entries from a pre-saved dataset.
 
         Args:
-            saved_entries (List[dict]): A list of dictionaries, each containing
+            saved_entries (list[dict[str, str]]): A list of dictionaries, each containing
                                         "positive" and "negative" keys.
         """
         for entry in saved_entries:
@@ -54,16 +53,16 @@ class Dataset:
                 self.add_entry(entry["positive"], entry["negative"])
             else:
                 raise ValueError(
-                    "Each entry must have 'positive' and \
-                                 'negative' keys."
+                    "Each entry must have 'positive' and "
+                    "'negative' keys."
                 )
 
-    def view_dataset(self) -> List[DatasetEntry]:
+    def view_dataset(self) -> list[DatasetEntry]:
         """
         Returns the current dataset as a list of DatasetEntry objects.
 
         Returns:
-            List[DatasetEntry]: The list of all entries in the dataset.
+            list[DatasetEntry]: The list of all entries in the dataset.
         """
         return self.entries
 
@@ -72,7 +71,7 @@ class Dataset:
         Saves the dataset to a JSON file.
 
         Args:
-            file_path (str): The path to the file where the dataset will be \
+            file_path (str): The path to the file where the dataset will be
                 saved.
         """
         with open(file_path, "w") as file:
@@ -81,9 +80,9 @@ class Dataset:
 
     @staticmethod
     def _apply_chat_template(
-        tokenizer, 
-        system_role: str, 
-        content1: str, 
+        tokenizer: PreTrainedTokenizerBase,
+        system_role: str,
+        content1: str,
         content2: str,
         add_generation_prompt: bool = True
     ) -> str:
@@ -97,8 +96,8 @@ class Dataset:
             messages.append({"role": "system", "content": f"{system_role}{content1}."})
 
         messages.append({"role": "user", "content": content2})
-        
-        tokenized = tokenizer.apply_chat_template(
+
+        tokenized: str = tokenizer.apply_chat_template(  # type: ignore[attr-defined,assignment]
             messages,
             tokenize=False,
             add_generation_prompt=add_generation_prompt,
@@ -110,25 +109,25 @@ class Dataset:
     @classmethod
     def create_dataset(
 
-        cls, 
-        model_name: str, 
-        contrastive_pair: list, 
+        cls,
+        model_name: str,
+        contrastive_pair: list[str],
         system_role: str = "Act as if you are extremely ",
-        prompt_type: str = "sentence-starters", 
+        prompt_type: str = "sentence-starters",
         num_sents: int = 300,
     ) -> "Dataset":
 
         """
-        Creates a dataset by generating positive and negative examples based on a given model, 
+        Creates a dataset by generating positive and negative examples based on a given model,
         contrastive pairs, and prompt variations.
-        This function uses a tokenizer to process input prompts and applies a chat template 
-        to generate positive and negative examples for each variation. The resulting examples 
+        This function uses a tokenizer to process input prompts and applies a chat template
+        to generate positive and negative examples for each variation. The resulting examples
         are added to a dataset object.
-        
+
         Args:
             cls: The class instance (used for accessing class methods).
             model_name (str): The name of the pre-trained model to use for tokenization.
-            contrastive_pair (list): A list containing two elements representing the positive and negative contrastive pairs.
+            contrastive_pair (list[str]): A list containing two elements representing the positive and negative contrastive pairs.
             system_role (str, optional): A string representing the system's role in the chat template. Defaults to "Act as if you are extremely ".
             prompt_type (str, optional): The type of prompt variations to use. Defaults to "sentence-starters".
             num_sents (int, optional): The number of prompt variations to process. Defaults to 300.
@@ -178,9 +177,9 @@ class Dataset:
 
     @classmethod
     def load_dataset(
-        cls, 
-        model_name: str, 
-        name: str, 
+        cls,
+        model_name: str,
+        name: str,
         num_sents: int = 300
     ) -> "Dataset":
         """

@@ -1,9 +1,18 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
-from IPython.display import HTML
+from typing import TYPE_CHECKING, Any, Literal
 
 import torch
 from transformers import AutoTokenizer
-from typing import Union, List
+
+from .shared import model_layer_list
+
+if TYPE_CHECKING:
+    from IPython.display import HTML
+
+    from .vector import SteeringModel, SteeringVector
+
 
 def html_value_to_color(val: float, vmin: float, vmax: float) -> str:
     """
@@ -50,12 +59,12 @@ def highlight_token(score: float, vmin: float = -1.0, vmax: float = 1.0) -> str:
 
 def visualize_activation(
     input_text: str,
-    model: "SteeringModel",
-    control_vector: "SteeringVector",
-    layer_index: Union[int, List[int]] = None,
-    mode: str = "ansi",
-    show_score: bool = False
-) -> Union[str, HTML]:
+    model: SteeringModel,
+    control_vector: SteeringVector,
+    layer_index: int | list[int] | None = None,
+    mode: Literal["ansi", "html"] = "ansi",
+    show_score: bool = False,
+) -> str | HTML:
     """
     Highlight token activations by projecting hidden states onto a steering vector.
 
@@ -86,11 +95,11 @@ def visualize_activation(
         layers_to_use = layer_index
 
     # Prepare a container to store hidden states.
-    hook_states = {}
+    hook_states: dict[int, Any] = {}
 
     # Define and register hook function for each layer.
-    def get_hook_fn(key):
-        def hook_fn(module, inp, out):
+    def get_hook_fn(key: int) -> Any:
+        def hook_fn(module: torch.nn.Module, inp: Any, out: Any) -> None:
             if isinstance(out, tuple):
                 hook_states[key] = out[0]
             else:
@@ -98,14 +107,6 @@ def visualize_activation(
         return hook_fn
 
     # Retrieve the list of layers from the model.
-    def model_layer_list(m):
-        if hasattr(m, "model"):
-            return m.model.layers
-        elif hasattr(m, "transformer"):
-            return m.transformer.h
-        else:
-            raise ValueError("Cannot locate layers for this model type")
-
     layers = model_layer_list(model.model)
 
     # Register hooks on each requested layer.
@@ -163,6 +164,7 @@ def visualize_activation(
                 f"{label}</span>"
             )
         html += "</div>"
+        from IPython.display import HTML
         return HTML(html)
 
 
