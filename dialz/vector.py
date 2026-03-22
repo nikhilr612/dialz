@@ -484,7 +484,11 @@ class SteeringModel(torch.nn.Module):
     """
 
     def __init__(
-        self, model_name: str, layer_ids: Iterable[int], token: str | None = None
+        self,
+        model_name: str,
+        layer_ids: Iterable[int],
+        token: str | None = None,
+        torch_dtype: torch.dtype = torch.float16,
     ) -> None:
         """
         **This mutates the wrapped `model`! Be careful using `model` after passing it to this class.**
@@ -497,7 +501,7 @@ class SteeringModel(torch.nn.Module):
         self.model_name = model_name
 
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name, token=token, torch_dtype=torch.float16
+            self.model_name, token=token, torch_dtype=torch_dtype
         )
         self.token = token
 
