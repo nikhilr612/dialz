@@ -45,6 +45,9 @@ class SteeringVector:
                     Defaults to 32. Try reducing this if you're running out of memory.
                 method (str, optional): The training method to use. Can be either
                     "pca" or "pca_center". Defaults to "pca".
+                token_index (int, optional): Index into non-padding tokens to extract
+                    activations from. -1 selects the last non-padding token (default),
+                    0 the first, etc.
 
         Returns:
             SteeringVector: The trained vector.
@@ -193,6 +196,7 @@ def read_representations(
     transform_hiddens: (
         typing.Callable[[dict[int, np.ndarray]], dict[int, np.ndarray]] | None
     ) = None,
+    token_index: int = -1,
 ) -> dict[int, np.ndarray]:
     """
     Extract the representations based on the contrast dataset.
@@ -208,7 +212,7 @@ def read_representations(
     train_strs = [s for ex in inputs.entries for s in (ex.positive, ex.negative)]
 
     layer_hiddens = batched_get_hiddens(
-        model, tokenizer, train_strs, hidden_layers, batch_size
+        model, tokenizer, train_strs, hidden_layers, batch_size, token_index
     )
 
     if transform_hiddens is not None:
@@ -276,10 +280,16 @@ def batched_get_hiddens(
     inputs: list[str],
     hidden_layers: list[int],
     batch_size: int,
+    token_index: int = -1,
 ) -> dict[int, np.ndarray]:
     """
     Using the given model and tokenizer, pass the inputs through the model and get the hidden
-    states for each layer in `hidden_layers` for the last token.
+    states for each layer in `hidden_layers` for the given token position.
+
+    Args:
+        token_index: Index into non-padding tokens to extract activations from.
+            -1 selects the last non-padding token, 0 the first, etc.
+            Clamped to the last non-padding token if out of range.
 
     Returns a dictionary from `hidden_layers` layer id to an numpy array of shape `(n_inputs, hidden_dim)`
     """
@@ -289,19 +299,18 @@ def batched_get_hiddens(
     hidden_states = {layer: [] for layer in hidden_layers}
     with torch.no_grad():
         for batch in tqdm.tqdm(batched_inputs):
-            # get the last token, handling right padding if present
+            # extract activations at token_index, handling right padding if present
             encoded_batch = tokenizer(batch, padding=True, return_tensors="pt")
             encoded_batch = encoded_batch.to(model.device)
             out = model(**encoded_batch, output_hidden_states=True)
             attention_mask = encoded_batch["attention_mask"]
             for i in range(len(batch)):
-                last_non_padding_index = (
-                    attention_mask[i].nonzero(as_tuple=True)[0][-1].item()
-                )
+                non_padding_indices = attention_mask[i].nonzero(as_tuple=True)[0]
+                token_pos = non_padding_indices[token_index].item()
                 for layer in hidden_layers:
                     hidden_idx = layer + 1 if layer >= 0 else layer
                     hidden_state = (
-                        out.hidden_states[hidden_idx][i][last_non_padding_index]
+                        out.hidden_states[hidden_idx][i][token_pos]
                         .cpu()
                         .float()
                         .numpy()
