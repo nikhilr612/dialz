@@ -1,3 +1,5 @@
+"""Dialz — a toolkit for activation steering vector research."""
+
 from . import dataset, score, vector, visualize
 from .dataset import Dataset
 from .score import get_activation_score

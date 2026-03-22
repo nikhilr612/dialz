@@ -1,3 +1,5 @@
+"""Activation scoring utilities for steering vector analysis."""
+
 from typing import Any
 
 import torch

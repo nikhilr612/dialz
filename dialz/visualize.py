@@ -1,3 +1,5 @@
+"""Visualization helpers for token-level activation highlighting."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -104,6 +106,7 @@ def visualize_activation(
                 hook_states[key] = out[0]
             else:
                 hook_states[key] = out
+
         return hook_fn
 
     # Retrieve the list of layers from the model.
@@ -141,14 +144,18 @@ def visualize_activation(
         hidden = hook_states[idx][0]
         # Use the provided index; if not found in control_vector.directions,
         # try using the real (non-negative) index.
-        key_for_direction = idx if idx in control_vector.directions else (len(layers) + idx)
+        key_for_direction = (
+            idx if idx in control_vector.directions else (len(layers) + idx)
+        )
         direction = torch.tensor(
             control_vector.directions[key_for_direction],
             device=model.device,
             dtype=model.model.dtype,
         )
         for i in range(seq_len):
-            aggregated[i] += (torch.dot(hidden[i+1], direction).item() if i+1 < seq_len else 0.0)
+            aggregated[i] += (
+                torch.dot(hidden[i + 1], direction).item() if i + 1 < seq_len else 0.0
+            )
     avg_scores = [s / len(layers_to_use) for s in aggregated]
     max_abs = max(abs(s) for s in avg_scores) or 1.0
 
@@ -165,8 +172,8 @@ def visualize_activation(
             )
         html += "</div>"
         from IPython.display import HTML
-        return HTML(html)
 
+        return HTML(html)
 
     ansi_output = ""
     for (start, end), score in zip(offsets, avg_scores):
