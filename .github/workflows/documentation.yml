@@ -16,7 +16,7 @@ jobs:
           uv sync --group docs
       - name: Sphinx build
         run: |
-          sphinx-build docs build
+          uv run sphinx-build docs build
       - name: Deploy to GitHub Pages
         uses: peaceiris/actions-gh-pages@v3
         if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
