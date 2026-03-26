@@ -1,27 +1,218 @@
+"""Steering vector training, activation extraction, and model control."""
+
 import os
-import typing
 import warnings
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable, Protocol
 
 import gguf
+import numpy as np
+import pyarrow as pa
 import torch
 import tqdm
-import numpy as np
-
 from sklearn.decomposition import PCA
-from dataclasses import dataclass
 from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
     PretrainedConfig,
     PreTrainedModel,
     PreTrainedTokenizerBase,
-    AutoTokenizer,
-    AutoModelForCausalLM,
 )
 
-from .dataset import DatasetEntry
+from .dataset import Dataset
+from .shared import model_layer_list
+from .types import Method
+
+
+class SteeringStrategy(Protocol):
+    """Protocol for steering direction extraction strategies.
+
+    Any callable that accepts a 2-D hidden-state matrix ``(n, hidden_dim)``
+    and returns a 1-D direction vector ``(hidden_dim,)`` satisfies this
+    protocol.
+    """
+
+    def __call__(self, h: np.ndarray) -> np.ndarray:
+        """Compute a steering direction from hidden-state activations.
+
+        Args:
+            h: Matrix of shape ``(n, hidden_dim)`` where even rows are
+                positive examples and odd rows are negative.
+
+        Returns:
+            Direction vector of shape ``(hidden_dim,)``.
+        """
+        ...
+
+
+class PCASteeringStrategy:
+    """First principal component of positive–negative differences.
+
+    For each contrastive pair, computes ``positive − negative`` and
+    fits a 1-component PCA on the resulting differences.
+    """
+
+    def __call__(self, h: np.ndarray) -> np.ndarray:
+        train = h[::2] - h[1::2]
+        pca = PCA(n_components=1, whiten=False).fit(train)
+        return pca.components_.astype(np.float32).squeeze(axis=0)
+
+
+class PCACenterSteeringStrategy:
+    """PCA on class-centered hidden states.
+
+    Centers both positive and negative activations around their joint mean,
+    then fits a 1-component PCA on the centered activations.
+    """
+
+    def __call__(self, h: np.ndarray) -> np.ndarray:
+        center = (h[::2] + h[1::2]) / 2
+        h = h.copy()
+        h[::2] -= center
+        h[1::2] -= center
+        pca = PCA(n_components=1, whiten=False).fit(h)
+        return pca.components_.astype(np.float32).squeeze(axis=0)
+
+
+class UMAPSteeringStrategy:
+    """UMAP-weighted activation sum (experimental).
+
+    Embeds all hidden states into 1-D with UMAP and computes a
+    weighted sum of the original activations using the embedding
+    as weights.
+    """
+
+    def __call__(self, h: np.ndarray) -> np.ndarray:
+        import umap  # type: ignore[import-untyped]
+
+        model = umap.UMAP(n_components=1)
+        embedding = model.fit_transform(h).astype(np.float32)
+        return np.sum(h * embedding, axis=0) / np.sum(embedding)
+
+
+class MeanDiffSteeringStrategy:
+    """Mean of positive–negative differences.
+
+    For each contrastive pair, computes ``positive − negative`` and
+    returns the element-wise mean across all pairs.
+    """
+
+    def __call__(self, h: np.ndarray) -> np.ndarray:
+        train = h[::2] - h[1::2]
+        return np.mean(train, axis=0).astype(np.float32)
+
+
+_strategy_map: dict[Method, type[SteeringStrategy]] = {
+    Method.PCA: PCASteeringStrategy,
+    Method.PCA_CENTER: PCACenterSteeringStrategy,
+    Method.UMAP: UMAPSteeringStrategy,
+    Method.MEAN_DIFF: MeanDiffSteeringStrategy,
+}
+
+
+def _resolve_strategy(method: Method | SteeringStrategy | str) -> SteeringStrategy:
+    """Resolve a method argument into a callable :class:`SteeringStrategy`.
+
+    Strings are converted to :class:`Method` first.  :class:`Method` values
+    are mapped to their default concrete class.  Anything already satisfying
+    the :class:`SteeringStrategy` protocol is returned as-is.
+    """
+    if isinstance(method, str):
+        method = Method(method)
+    if not isinstance(method, Method):
+        return method
+    return _strategy_map[method]()
+
+
+def _flatten_dataset(
+    dataset: Dataset,
+) -> tuple[list[str], list[int], list[str]]:
+    """Flatten Dataset into interleaved positive/negative strings with metadata."""
+    train_strs: list[str] = []
+    example_ids: list[int] = []
+    example_classes: list[str] = []
+    for idx, ex in enumerate(dataset.entries):
+        train_strs.append(ex.positive)
+        example_ids.append(idx)
+        example_classes.append("positive")
+        train_strs.append(ex.negative)
+        example_ids.append(idx)
+        example_classes.append("negative")
+    return train_strs, example_ids, example_classes
+
+
+def _batched_forward(
+    model: "PreTrainedModel | SteeringModel",
+    tokenizer: PreTrainedTokenizerBase,
+    inputs: list[str],
+    hidden_layers: list[int],
+    token_indices: list[int],
+    batch_size: int,
+) -> dict[tuple[int, int], list[np.ndarray]]:
+    """Run a forward pass and collect hidden states per (layer, token_index).
+
+    This is the shared core used by :func:`batched_get_hiddens` and
+    :func:`extract_activations`.  It batches inputs, runs the model once per
+    batch, and extracts hidden states at every requested combination of layer
+    and non-padding token position.
+
+    Args:
+        model: A ``PreTrainedModel`` or :class:`SteeringModel`.
+        tokenizer: Tokenizer compatible with *model*.
+        inputs: Raw input strings (already flattened).
+        hidden_layers: Layer indices (normalized, non-negative).
+        token_indices: Token-position indices into non-padding tokens
+            (e.g. ``[-1, 0]`` for last and first).
+        batch_size: Number of inputs per forward pass.
+
+    Returns:
+        Dict mapping ``(layer, token_index)`` tuples to lists of numpy arrays
+        (one array per input string).
+    """
+    batched_inputs = [
+        inputs[p : p + batch_size] for p in range(0, len(inputs), batch_size)
+    ]
+    activations: dict[tuple[int, int], list[np.ndarray]] = {
+        (layer, ti): [] for layer in hidden_layers for ti in token_indices
+    }
+    with torch.no_grad():
+        for batch in tqdm.tqdm(batched_inputs):
+            encoded_batch = tokenizer(batch, padding=True, return_tensors="pt")
+            encoded_batch = encoded_batch.to(model.device)
+            out = model(**encoded_batch, output_hidden_states=True)
+            attention_mask = encoded_batch["attention_mask"]
+            for i in range(len(batch)):
+                # todo: add type annotations for `encoded_batch`
+                non_padding_indices = attention_mask[i].nonzero(as_tuple=True)[0]  # type: ignore
+                for ti in token_indices:
+                    token_pos = non_padding_indices[ti].item()
+                    for layer in hidden_layers:
+                        hidden_idx = layer + 1 if layer >= 0 else layer
+                        hidden_state = (
+                            out.hidden_states[hidden_idx][i][token_pos]
+                            .cpu()
+                            .float()
+                            .numpy()
+                        )
+                        activations[(layer, ti)].append(hidden_state)
+            del out
+
+    return activations
 
 
 @dataclass
 class SteeringVector:
+    """A per-layer steering direction for activation-level model control.
+
+    Steering vectors can be combined arithmetically (``+``, ``-``, ``*``,
+    ``/``), serialized to GGUF files, and applied to a
+    :class:`SteeringModel` via :meth:`SteeringModel.set_control`.
+
+    Attributes:
+        model_type: HuggingFace model type string (e.g. ``"mistral"``).
+        directions: Mapping from layer index to direction vector.
+    """
+
     model_type: str
     directions: dict[int, np.ndarray]
 
@@ -29,25 +220,33 @@ class SteeringVector:
     def train(
         cls,
         model: "PreTrainedModel | SteeringModel",
-        dataset: list[DatasetEntry],
-        method: str = "pca",
+        dataset: Dataset,
+        method: Method | SteeringStrategy | str = Method.PCA,
         **kwargs,
     ) -> "SteeringVector":
         """
-        Train a SteeringVector for a given model and tokenizer using the provided dataset.
+        Train a SteeringVector from a contrastive dataset.
+
+        A tokenizer is loaded automatically from ``model.model_name``.
 
         Args:
-            model (PreTrainedModel | SteeringModel): The model to train against.
-            tokenizer (PreTrainedTokenizerBase): The tokenizer to tokenize the dataset.
-            dataset (list[DatasetEntry]): The dataset used for training.
-            **kwargs: Additional keyword arguments.
-                max_batch_size (int, optional): The maximum batch size for training.
-                    Defaults to 32. Try reducing this if you're running out of memory.
-                method (str, optional): The training method to use. Can be either
-                    "pca" or "pca_center". Defaults to "pca".
+            model: The model to train against (must have ``model_name``
+                and ``token`` attributes).
+            dataset: The contrastive dataset used for training.
+            method: The extraction strategy.  Accepts a
+                :class:`~dialz.types.Method` enum, a string (``"pca"``,
+                ``"mean_diff"``, etc.), or any custom
+                :class:`SteeringStrategy` callable.  Defaults to
+                ``Method.PCA``.
+            **kwargs: Forwarded to :func:`read_representations`.
+                Useful keys:
+
+                * **batch_size** (*int*) -- max batch size (default 32).
+                * **token_index** (*int*) -- token position index into
+                  non-padding tokens (default ``-1``, last token).
 
         Returns:
-            SteeringVector: The trained vector.
+            The trained steering vector.
         """
         tokenizer = AutoTokenizer.from_pretrained(model.model_name, token=model.token)
         tokenizer.pad_token_id = 0
@@ -62,16 +261,20 @@ class SteeringVector:
             )
         return cls(model_type=model.config.model_type, directions=dirs)
 
-    def export_gguf(self, path: os.PathLike[str] | str):
-        """
-        Export a trained SteeringVector to a llama.cpp .gguf file.
-        Note: This file can't be used with llama.cpp yet. WIP!
+    def export_gguf(self, path: os.PathLike[str] | str) -> None:
+        """Export this steering vector to a GGUF file.
 
-        ```python
-        vector = SteeringVector.train(...)
-        vector.export_gguf("path/to/write/vector.gguf")
-        ```
-        ```
+        Note:
+            The GGUF format is not yet supported by llama.cpp for steering
+            vectors.  This is a WIP serialisation target.
+
+        Args:
+            path: File path to write the ``.gguf`` file to.
+
+        Example::
+
+            vector = SteeringVector.train(model, dataset)
+            vector.export_gguf("vector.gguf")
         """
 
         arch = "steeringvector"
@@ -87,6 +290,17 @@ class SteeringVector:
 
     @classmethod
     def import_gguf(cls, path: os.PathLike[str] | str) -> "SteeringVector":
+        """Load a steering vector from a GGUF file.
+
+        Args:
+            path: Path to the ``.gguf`` file.
+
+        Returns:
+            The deserialized steering vector.
+
+        Raises:
+            ValueError: If required GGUF fields are missing or malformed.
+        """
         reader = gguf.GGUFReader(path)
 
         archf = reader.get_field("general.architecture")
@@ -110,7 +324,7 @@ class SteeringVector:
                 continue
             try:
                 layer = int(tensor.name.split(".")[1])
-            except:
+            except Exception:  # todo: fix with correct error type.
                 raise ValueError(
                     f".gguf file has invalid direction field name: {tensor.name}"
                 )
@@ -138,7 +352,11 @@ class SteeringVector:
                 directions[layer] = other_layer
         return SteeringVector(model_type=model_type, directions=directions)
 
-    def __eq__(self, other: "SteeringVector") -> bool:
+    def __eq__(self, other: object) -> bool:
+
+        if not isinstance(other, SteeringVector):
+            return False
+
         if self is other:
             return True
 
@@ -180,22 +398,50 @@ class SteeringVector:
     def __rmul__(self, other: int | float | np.int_ | np.float64) -> "SteeringVector":
         return self.__mul__(other)
 
-    def __truediv__(self, other: int | float | np.int_ | np.float64) -> "SteeringVector":
+    def __truediv__(
+        self, other: int | float | np.int_ | np.float64
+    ) -> "SteeringVector":
         return self.__mul__(1 / other)
+
 
 def read_representations(
     model: "PreTrainedModel | SteeringModel",
     tokenizer: PreTrainedTokenizerBase,
-    inputs: list[DatasetEntry],
-    hidden_layers: typing.Iterable[int] | None = None,
+    inputs: Dataset,
+    hidden_layers: Iterable[int] | None = None,
     batch_size: int = 32,
-    method: typing.Literal["pca", "pca_center", "umap", "mean_diff"] = "pca",
+    method: Method | SteeringStrategy | str = Method.PCA,
     transform_hiddens: (
-        typing.Callable[[dict[int, np.ndarray]], dict[int, np.ndarray]] | None
+        Callable[[dict[int, np.ndarray]], dict[int, np.ndarray]] | None
     ) = None,
+    token_index: int = -1,
 ) -> dict[int, np.ndarray]:
     """
-    Extract the representations based on the contrast dataset.
+    Extract per-layer steering directions from a contrastive dataset.
+
+    Flattens *inputs* into interleaved positive/negative strings, runs
+    the model in batches, and applies the chosen :class:`SteeringStrategy`
+    to each layer's hidden states.  A sign-alignment step ensures the
+    direction points from negative toward positive.
+
+    Args:
+        model: A ``PreTrainedModel`` or :class:`SteeringModel`.
+        tokenizer: Tokenizer compatible with *model*.
+        inputs: Contrastive dataset (positive/negative pairs).
+        hidden_layers: Layer indices to extract.  ``None`` defaults to
+            every layer (negative indices accepted).
+        batch_size: Batch size for inference.
+        method: Extraction strategy (:class:`Method` enum, string, or
+            custom :class:`SteeringStrategy`).
+        transform_hiddens: Optional callable applied to the full
+            ``{layer: array}`` dict *after* extraction but *before*
+            direction computation.
+        token_index: Token-position index into non-padding tokens
+            (``-1`` = last token).
+
+    Returns:
+        Mapping from layer index to direction vector of shape
+        ``(hidden_dim,)``.
     """
     if not hidden_layers:
         hidden_layers = range(-1, -model.config.num_hidden_layers, -1)
@@ -205,115 +451,160 @@ def read_representations(
     hidden_layers = [i if i >= 0 else n_layers + i for i in hidden_layers]
 
     # The order is [positive, negative, positive, negative, ...]
-    train_strs = [s for ex in inputs.entries for s in (ex.positive, ex.negative)]
+    train_strs, _, _ = _flatten_dataset(inputs)
 
     layer_hiddens = batched_get_hiddens(
-        model, tokenizer, train_strs, hidden_layers, batch_size
+        model, tokenizer, train_strs, hidden_layers, batch_size, token_index
     )
 
     if transform_hiddens is not None:
         layer_hiddens = transform_hiddens(layer_hiddens)
 
-    # Get directions for each layer using the specified method
+    # Get directions for each layer using the specified strategy
+    strategy = _resolve_strategy(method)
     directions: dict[int, np.ndarray] = {}
     for layer in tqdm.tqdm(hidden_layers):
         h = layer_hiddens[layer]
         assert h.shape[0] == len(inputs.entries) * 2
 
-        if method == "pca":
-            train = h[::2] - h[1::2]
-        elif method == "pca_center":
-            center = (h[::2] + h[1::2]) / 2
-            train = h.copy()  # make a copy to avoid modifying the original h
-            train[::2] -= center
-            train[1::2] -= center
-        elif method == "umap":
-            train = h
-        elif method == "mean_diff":
-            # Compute the mean difference directly from the contrastive pairs.
-            # Here, train contains the differences for each pair.
-            train = h[::2] - h[1::2]
-            directions[layer] = np.mean(train, axis=0).astype(np.float32)
-        else:
-            raise ValueError("unknown method " + method)
-
-        if method not in ["umap", "mean_diff"]:
-            # For PCA-based methods, compute the first principal component.
-            pca_model = PCA(n_components=1, whiten=False).fit(train)
-            directions[layer] = pca_model.components_.astype(np.float32).squeeze(axis=0)
-        elif method == "umap":
-            # UMAP-based approach (experimental)
-            import umap  # type: ignore
-
-            umap_model = umap.UMAP(n_components=1)
-            embedding = umap_model.fit_transform(train).astype(np.float32)
-            directions[layer] = np.sum(train * embedding, axis=0) / np.sum(embedding)
+        directions[layer] = strategy(h)
 
         # Calculate sign to ensure the direction aligns with the sentiment order.
         projected_hiddens = project_onto_direction(h, directions[layer])
-        positive_smaller_mean = np.mean(
-            [
-                projected_hiddens[i] < projected_hiddens[i + 1]
-                for i in range(0, len(inputs.entries) * 2, 2)
-            ]
+        positive_smaller_mean = float(
+            np.mean(
+                [
+                    projected_hiddens[i] < projected_hiddens[i + 1]
+                    for i in range(0, len(inputs.entries) * 2, 2)
+                ]
+            )
         )
-        positive_larger_mean = np.mean(
-            [
-                projected_hiddens[i] > projected_hiddens[i + 1]
-                for i in range(0, len(inputs.entries) * 2, 2)
-            ]
+        positive_larger_mean = float(
+            np.mean(
+                [
+                    projected_hiddens[i] > projected_hiddens[i + 1]
+                    for i in range(0, len(inputs.entries) * 2, 2)
+                ]
+            )
         )
 
-        if positive_smaller_mean > positive_larger_mean:  # type: ignore
+        if positive_smaller_mean > positive_larger_mean:
             directions[layer] *= -1
 
     return directions
 
 
 def batched_get_hiddens(
-    model,
-    tokenizer,
+    model: "PreTrainedModel | SteeringModel",
+    tokenizer: PreTrainedTokenizerBase,
     inputs: list[str],
     hidden_layers: list[int],
     batch_size: int,
+    token_index: int = -1,
 ) -> dict[int, np.ndarray]:
+    """Extract hidden-state activations at a single token position.
+
+    Batches *inputs*, runs a forward pass, and returns stacked hidden
+    states for each requested layer at the given token position.
+
+    Args:
+        model: A ``PreTrainedModel`` or :class:`SteeringModel`.
+        tokenizer: Tokenizer compatible with *model*.
+        inputs: Raw input strings.
+        hidden_layers: Layer indices to extract.
+        batch_size: Batch size for inference.
+        token_index: Token-position index into non-padding tokens.
+            ``-1`` selects the last non-padding token, ``0`` the first.
+
+    Returns:
+        Dict mapping layer index to array of shape
+        ``(n_inputs, hidden_dim)``.
     """
-    Using the given model and tokenizer, pass the inputs through the model and get the hidden
-    states for each layer in `hidden_layers` for the last token.
+    raw = _batched_forward(
+        model, tokenizer, inputs, hidden_layers, [token_index], batch_size
+    )
+    return {layer: np.vstack(raw[(layer, token_index)]) for layer in hidden_layers}
 
-    Returns a dictionary from `hidden_layers` layer id to an numpy array of shape `(n_inputs, hidden_dim)`
+
+def extract_activations(
+    model: "PreTrainedModel | SteeringModel",
+    tokenizer: PreTrainedTokenizerBase,
+    dataset: Dataset,
+    hidden_layers: list[int],
+    token_indices: list[int],
+    batch_size: int = 32,
+) -> pa.Table:
     """
-    batched_inputs = [
-        inputs[p : p + batch_size] for p in range(0, len(inputs), batch_size)
-    ]
-    hidden_states = {layer: [] for layer in hidden_layers}
-    with torch.no_grad():
-        for batch in tqdm.tqdm(batched_inputs):
-            # get the last token, handling right padding if present
-            encoded_batch = tokenizer(batch, padding=True, return_tensors="pt")
-            encoded_batch = encoded_batch.to(model.device)
-            out = model(**encoded_batch, output_hidden_states=True)
-            attention_mask = encoded_batch["attention_mask"]
-            for i in range(len(batch)):
-                last_non_padding_index = (
-                    attention_mask[i].nonzero(as_tuple=True)[0][-1].item()
-                )
-                for layer in hidden_layers:
-                    hidden_idx = layer + 1 if layer >= 0 else layer
-                    hidden_state = (
-                        out.hidden_states[hidden_idx][i][last_non_padding_index]
-                        .cpu()
-                        .float()
-                        .numpy()
-                    )
-                    hidden_states[layer].append(hidden_state)
-            del out
+    Run the model on a dataset and extract activations for a list of layers and token positions.
 
-    return {k: np.vstack(v) for k, v in hidden_states.items()}
+    Args:
+        model: The model to run.
+        tokenizer: The tokenizer to use.
+        dataset: Dataset of positive/negative pairs.
+        hidden_layers: List of layer indices to extract activations from.
+        token_indices: List of token position indices into non-padding tokens
+            (e.g., [-1, 0] for last and first tokens).
+        batch_size: Batch size for inference.
+
+    Returns:
+        pyarrow.Table with columns:
+            - activation: fixed_size_list[float32] — the activation vector
+            - layer: int32 — layer index
+            - token_index: int32 — token position index
+            - example_id: int32 — index in the original dataset
+            - example_class: string — "positive" or "negative"
+    """
+
+    n_layers = len(model_layer_list(model))
+    hidden_layers_norm = [i if i >= 0 else n_layers + i for i in hidden_layers]
+
+    train_strs, example_ids, example_classes = _flatten_dataset(dataset)
+    raw = _batched_forward(
+        model, tokenizer, train_strs, hidden_layers_norm, token_indices, batch_size
+    )
+
+    # Accumulators — one row per (example, layer, token_index)
+    activations: list[np.ndarray] = []
+    layers_out: list[int] = []
+    token_indices_out: list[int] = []
+    ids_out: list[int] = []
+    classes_out: list[str] = []
+
+    for (layer, ti), arr_list in raw.items():
+        for idx, act in enumerate(arr_list):
+            activations.append(act)
+            layers_out.append(layer)
+            token_indices_out.append(ti)
+            ids_out.append(example_ids[idx])
+            classes_out.append(example_classes[idx])
+
+    hidden_dim = activations[0].shape[0]
+    activation_array = pa.FixedSizeListArray.from_arrays(
+        pa.concat_arrays([pa.array(a, type=pa.float32()) for a in activations]),
+        hidden_dim,
+    )
+
+    return pa.table(
+        {
+            "activation": activation_array,
+            "layer": pa.array(layers_out, type=pa.int32()),
+            "token_index": pa.array(token_indices_out, type=pa.int32()),
+            "example_id": pa.array(ids_out, type=pa.int32()),
+            "example_class": pa.array(classes_out, type=pa.string()),
+        }
+    )
 
 
-def project_onto_direction(H, direction):
-    """Project matrix H (n, d_1) onto direction vector (d_2,)"""
+def project_onto_direction(H: np.ndarray, direction: np.ndarray) -> np.ndarray:
+    """Project rows of *H* onto a unit-scaled *direction* vector.
+
+    Args:
+        H: Matrix of shape ``(n, d)``.
+        direction: Vector of shape ``(d,)``.
+
+    Returns:
+        Array of shape ``(n,)`` — scalar projections.
+    """
     mag = np.linalg.norm(direction)
     assert not np.isinf(mag)
     return (H @ direction) / mag
@@ -327,28 +618,42 @@ class SteeringModel(torch.nn.Module):
     """
 
     def __init__(
-        self, model_name: str, layer_ids: typing.Iterable[int], token: str = None
-    ):
-        """
-        **This mutates the wrapped `model`! Be careful using `model` after passing it to this class.**
+        self,
+        model_name: str,
+        layer_ids: Iterable[int],
+        token: str | None = None,
+        torch_dtype: torch.dtype = torch.float16,
+    ) -> None:
+        """Wrap a pretrained causal-LM for layer-wise steering control.
 
-        Build a new SteeringModel around a model instance, initializing control on
-        the layers specified in `layer_ids`.
+        .. warning::
+           This **mutates** the underlying model by replacing selected
+           layers with :class:`SteeringModule` wrappers.  Do not use the
+           original model reference after construction.
+
+        Args:
+            model_name: HuggingFace model identifier.
+            layer_ids: Layer indices to make controllable.  Negative
+                indices count from the end.
+            token: Optional HuggingFace auth token.
+            torch_dtype: Precision for loading the model weights.
         """
 
         super().__init__()
         self.model_name = model_name
 
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model_name, token=token, torch_dtype=torch.float16
+            self.model_name, token=token, torch_dtype=torch_dtype
         )
         self.token = token
 
-        self.model = self.model.to(
+        device = (
             "cuda:0"
             if torch.cuda.is_available()
-            else "mps:0" if torch.backends.mps.is_available() else "cpu"
+            else ("mps:0" if torch.backends.mps.is_available() else "cpu")
         )
+
+        self.model = self.model.to(device)  # type: ignore[arg-type]
 
         layers = model_layer_list(self.model)
         self.layer_ids = [i if i >= 0 else len(layers) + i for i in layer_ids]
@@ -363,10 +668,12 @@ class SteeringModel(torch.nn.Module):
 
     @property
     def config(self) -> PretrainedConfig:
+        """Model configuration (delegates to the wrapped model)."""
         return self.model.config
 
     @property
     def device(self) -> torch.device:
+        """Device the model resides on."""
         return self.model.device
 
     def unwrap(self) -> PreTrainedModel:
@@ -377,22 +684,25 @@ class SteeringModel(torch.nn.Module):
 
         layers = model_layer_list(self.model)
         for layer_id in self.layer_ids:
-            layers[layer_id] = layers[layer_id].block
+            layer = layers[layer_id]
+            assert isinstance(layer, SteeringModule)
+            layers[layer_id] = layer.block
         return self.model
 
     def set_control(
         self, control: "SteeringVector", scalar: float = 1.0, **kwargs
     ) -> None:
-        """
-        Set a `SteeringVector` for the layers this SteeringModel handles, with a strength given
-        by `scalar`. (Negative `scalar` values invert the control vector, e.g. happiness→sadness.)
-        `scalar` defaults to `1.0`.
+        """Apply a :class:`SteeringVector` to the controllable layers.
 
-        Additional kwargs:
-        - `normalize: bool`: track the magnitude of the non-modified activation, and rescale the
-          activation to that magnitude after control (default: `False`)
-        - `operator: Callable[[Tensor, Tensor], Tensor]`: how to combine the base output and control
-          (default: +)
+        Args:
+            control: Steering vector whose layer directions will be
+                applied.
+            scalar: Strength multiplier.  Negative values invert the
+                direction (e.g. happiness → sadness).
+            **kwargs: Passed to :class:`BlockControlParams`.
+                ``normalize`` (bool) rescales activations to their
+                pre-control magnitude.  ``operator`` (callable)
+                overrides the default ``+`` combination.
         """
 
         raw_control = {}
@@ -428,66 +738,87 @@ class SteeringModel(torch.nn.Module):
 
         layers = model_layer_list(self.model)
         for layer_id in self.layer_ids:
-            layer: SteeringModule = layers[layer_id]  # type: ignore
+            layer = layers[layer_id]
+            assert isinstance(layer, SteeringModule)
             if control is None:
                 layer.reset()
             else:
                 layer.set_control(BlockControlParams(control[layer_id], **kwargs))
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Delegate to the wrapped model's ``forward``."""
         return self.model.forward(*args, **kwargs)
 
-    def generate(self, *args, **kwargs):
-        
+    def generate(self, *args: Any, **kwargs: Any) -> Any:
+        """Delegate to the wrapped model's ``generate``."""
         return self.model.generate(*args, **kwargs)
 
-    def __call__(self, *args, **kwargs):
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        """Delegate to the wrapped model's ``__call__``."""
         return self.model(*args, **kwargs)
-
-
-def model_layer_list(model: SteeringModel | PreTrainedModel) -> torch.nn.ModuleList:
-    if isinstance(model, SteeringModel):
-        model = model.model
-
-    if hasattr(model, "model"):  # mistral-like
-        return model.model.layers
-    elif hasattr(model, "transformer"):  # gpt-2-like
-        return model.transformer.h
-    else:
-        raise ValueError(f"don't know how to get layer list for {type(model)}")
-
-
 
 
 @dataclass
 class BlockControlParams:
+    """Parameters controlling how a steering vector is applied to a single layer.
+
+    Attributes:
+        control: The control tensor to add (or ``None`` for no control).
+        normalize: If ``True``, rescale the modified activation to match
+            the original norm.
+        operator: Binary function combining base output and control
+            (default: element-wise addition).
+    """
+
     control: torch.Tensor | None = None
     normalize: bool = False
-    operator: typing.Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = (
+    operator: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = (
         lambda current, control: current + control
     )
 
     @classmethod
     def default(cls) -> "BlockControlParams":
+        """Return a default (no-op) parameter set."""
         return cls()
 
 
 class SteeringModule(torch.nn.Module):
+    """Wraps a transformer block to intercept and modify its output.
+
+    When a :class:`BlockControlParams` is set, the module applies the
+    control tensor to the block's output hidden states during the
+    forward pass, optionally normalising and masking padding tokens.
+    """
+
     def __init__(self, block: torch.nn.Module) -> None:
+        """Wrap a transformer block.
+
+        Args:
+            block: The original transformer layer module.
+        """
         super().__init__()
         self.block: torch.nn.Module = block
         self.params: BlockControlParams = BlockControlParams.default()
-        
-        if hasattr(block, 'attention_type'):
+
+        if hasattr(block, "attention_type"):
             self.attention_type = block.attention_type
 
     def set_control(self, params: BlockControlParams) -> None:
+        """Set the control parameters for this layer."""
         self.params = params
 
     def reset(self) -> None:
+        """Remove all control, restoring the original block behavior."""
         self.set_control(BlockControlParams.default())
 
-    def forward(self, *args, **kwargs):
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        """Run the block and apply control if set.
+
+        If ``self.params.control`` is ``None``, the original block output
+        is returned unchanged.  Otherwise the control tensor is broadcast
+        and combined with the block output via ``self.params.operator``,
+        optionally masked to skip padding positions and/or normalised.
+        """
         output = self.block(*args, **kwargs)
 
         control = self.params.control

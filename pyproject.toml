@@ -1,24 +1,35 @@
-[tool.poetry]
+[project]
 name = "dialz"
 version = "1.1.4"
-description = ""
-authors = ["groovychoons <siddiquezs2@cardiff.ac.uk>"]
+description = "The official repo for the Dialz Python library - a toolkit for steering vector research."
+authors = [{name = "groovychoons", email = "siddiquezs2@cardiff.ac.uk"}]
 readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.5.1",
+    "transformers>=4.46.3",
+    "accelerate>=1.1.1",
+    "python-dotenv>=1.0.1",
+    "gguf>=0.13.0",
+    "scikit-learn>=1.6.0",
+    "pyarrow>=19.0.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.10"
-torch = "^2.5.1"
-transformers = "^4.46.3"
-accelerate = "^1.1.1"
-python-dotenv = "^1.0.1"
-gguf = "^0.13.0"
-scikit-learn = "^1.6.0"
-
-[tool.poetry.group.dev.dependencies]
-pytest = "^8.3.4"
-black = "^24.10.0"
-pre-commit = "^4.0.1"
+[dependency-groups]
+dev = [
+    "pytest>=8.3.4",
+    "black>=24.10.0",
+    "pre-commit>=4.0.1",
+]
+docs = [
+    "furo",
+    "ipython",
+    "myst-nb",
+    "sphinx",
+    "sphinx-autodoc-typehints",
+    "sphinx-copybutton",
+]
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
