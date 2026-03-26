@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 from dataclasses import dataclass
 
 from dotenv import load_dotenv
@@ -122,6 +123,42 @@ class Dataset:
         )
         return tokenized
 
+    @staticmethod
+    def _extract_choice_marker(
+        text: str,
+    ) -> tuple[str, str | None]:
+        """Strip a trailing ``(A)`` / ``(B)`` choice marker and return the body.
+
+        Many of the bundled *load* datasets encode the target answer as a
+        trailing choice letter, e.g.::
+
+            "…question text…\\n(B)"
+
+        or::
+
+            "…question text…\\n\\nAnswer:\\n (A)"
+
+        When applying a chat template, the marker should live in the
+        *model's* turn (as the start of its continuation), not inside the
+        user message.  This helper extracts the marker so callers can
+        template the body separately and reattach the marker afterwards.
+
+        Args:
+            text: Raw dataset string that may end with a choice marker.
+
+        Returns:
+            A ``(body, marker)`` tuple.  *marker* is ``None`` when no
+            trailing choice letter is detected.
+        """
+        match = re.search(r"\n\n?Answer:\s*\(([A-Z])\)\s*$", text)
+        if match:
+            letter = match.group(1)
+            return text[: match.start()].rstrip(), f"({letter})"
+        match = re.search(r"\(([A-Z])\)\s*$", text)
+        if not match:
+            return text, None
+        return text[: match.start()].rstrip(), match.group(0).strip()
+
     @classmethod
     def create_dataset(
         cls,
@@ -232,12 +269,23 @@ class Dataset:
 
         # 4. Iterate through the first num_sents entries, apply templates
         for entry in raw_entries[:num_sents]:
+            pos_body, pos_marker = cls._extract_choice_marker(entry["positive"])
+            neg_body, neg_marker = cls._extract_choice_marker(entry["negative"])
+
             positive_transformed = cls._apply_chat_template(
-                tokenizer, system_role="", content1="", content2=entry["positive"]
+                tokenizer, system_role="", content1="", content2=pos_body
             )
             negative_transformed = cls._apply_chat_template(
-                tokenizer, system_role="", content1="", content2=entry["negative"]
+                tokenizer, system_role="", content1="", content2=neg_body
             )
+
+            # Reattach the choice marker *after* the template so it falls
+            # inside the model's turn rather than the user's.
+            if pos_marker:
+                positive_transformed += pos_marker
+            if neg_marker:
+                negative_transformed += neg_marker
+
             processed_dataset.add_entry(positive_transformed, negative_transformed)
 
         return processed_dataset
